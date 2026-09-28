@@ -1,0 +1,9 @@
+@echo off
+echo Installing dependencies...
+pip install -r requirements.txt
+echo Starting Backend Daemon...
+start /b python server.py
+timeout /t 3 /nobreak >nul
+echo Starting Nursery Rhyme Pipeline...
+python dynamic_rhyme_pipeline.py --preset hindi
+pause
