@@ -1,0 +1,32 @@
+2026-09-28 00:01:38,482 INFO    uvicorn.error Started server process [6652]
+2026-09-28 00:01:38,499 INFO    uvicorn.error Waiting for application startup.
+2026-09-28 00:01:40,651 INFO    rhyme_server Veo client ready (model=veo-3.1-fast-generate-preview, output=C:\Users\Administrator\google-flow\output\scenes)
+2026-09-28 00:01:40,651 INFO    rhyme_server listening on http://127.0.0.1:8080
+2026-09-28 00:01:40,782 INFO    rhyme_server generation worker started (concurrency=1)
+2026-09-28 00:01:40,782 INFO    uvicorn.error Application startup complete.
+2026-09-28 00:01:40,784 INFO    uvicorn.error Uvicorn running on http://127.0.0.1:8080 (Press CTRL+C to quit)
+2026-09-28 00:01:44,338 INFO    uvicorn.access 127.0.0.1:50306 - "GET /health HTTP/1.1" 200
+2026-09-28 00:01:44,534 INFO    rhyme_server [character 2324189f] LOCKED: The Numberlings
+2026-09-28 00:01:44,535 INFO    uvicorn.access 127.0.0.1:50307 - "POST /api/v1/characters/create HTTP/1.1" 201
+2026-09-28 00:01:45,964 INFO    uvicorn.access 127.0.0.1:50308 - "POST /api/v1/scenes/generate HTTP/1.1" 422
+2026-09-28 00:02:01,703 INFO    rhyme_server [task db3ed18e] QUEUED ('chaining test')
+2026-09-28 00:02:01,707 INFO    rhyme_server [task db3ed18e] IN_PROGRESS: 'chaining test'
+2026-09-28 00:02:01,731 INFO    uvicorn.access 127.0.0.1:50323 - "POST /api/v1/scenes/generate HTTP/1.1" 202
+2026-09-28 00:02:03,215 INFO    httpx HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/veo-3.1-fast-generate-preview:predictLongRunning "HTTP/1.1 400 Bad Request"
+2026-09-28 00:02:03,231 ERROR   rhyme_server [task db3ed18e] FAILED: scene db3ed18e20524f90aece57aa5f0249e8 failed on attempt 1: ClientError("400 INVALID_ARGUMENT. {'error': {'code': 400, 'message': 'API key not valid. Please pass a valid API key.', 'status': 'INVALID_ARGUMENT', 'details': [{'@type': 'type.googleapis.com/google.rpc.ErrorInfo', 'reason': 'API_KEY_INVALID', 'domain': 'googleapis.com', 'metadata': {'service': 'generativelanguage.googleapis.com'}}, {'@type': 'type.googleapis.com/google.rpc.LocalizedMessage', 'locale': 'en-US', 'message': 'API key not valid. Please pass a valid API key.'}]}}")
+2026-09-28 00:02:06,170 INFO    uvicorn.access 127.0.0.1:50333 - "GET /api/v1/tasks/db3ed18e20524f90aece57aa5f0249e8 HTTP/1.1" 200
+2026-09-28 00:02:06,529 INFO    rhyme_server [task 8b6364c8] QUEUED ('Untitled')
+2026-09-28 00:02:06,530 INFO    rhyme_server [task 8b6364c8] IN_PROGRESS: 'Untitled'
+2026-09-28 00:02:06,530 INFO    uvicorn.access 127.0.0.1:50335 - "POST /v1/video/generations HTTP/1.1" 202
+2026-09-28 00:02:06,706 INFO    httpx HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/veo-3.1-fast-generate-preview:predictLongRunning "HTTP/1.1 400 Bad Request"
+2026-09-28 00:02:06,706 ERROR   rhyme_server [task 8b6364c8] FAILED: scene 8b6364c805054a39afbbf14f9d00d1b6 failed on attempt 1: ClientError("400 INVALID_ARGUMENT. {'error': {'code': 400, 'message': 'API key not valid. Please pass a valid API key.', 'status': 'INVALID_ARGUMENT', 'details': [{'@type': 'type.googleapis.com/google.rpc.ErrorInfo', 'reason': 'API_KEY_INVALID', 'domain': 'googleapis.com', 'metadata': {'service': 'generativelanguage.googleapis.com'}}, {'@type': 'type.googleapis.com/google.rpc.LocalizedMessage', 'locale': 'en-US', 'message': 'API key not valid. Please pass a valid API key.'}]}}")
+2026-09-28 00:02:33,062 INFO    uvicorn.access 127.0.0.1:50376 - "GET /health HTTP/1.1" 200
+2026-09-28 00:02:33,071 INFO    rhyme_server [character 5a60c75d] LOCKED: The Numberlings
+2026-09-28 00:02:33,071 INFO    uvicorn.access 127.0.0.1:50376 - "POST /api/v1/characters/create HTTP/1.1" 201
+2026-09-28 00:02:33,085 INFO    rhyme_server [task 584f1050] QUEUED ('Scene 1: Ek do teen char, aao gine mere yaar')
+2026-09-28 00:02:33,086 INFO    rhyme_server [task 584f1050] IN_PROGRESS: 'Scene 1: Ek do teen char, aao gine mere yaar'
+2026-09-28 00:02:33,087 INFO    uvicorn.access 127.0.0.1:50376 - "POST /api/v1/scenes/generate HTTP/1.1" 202
+2026-09-28 00:02:33,109 INFO    uvicorn.access 127.0.0.1:50376 - "GET /api/v1/tasks/584f10501cf24ceca6dec7d8425517b9 HTTP/1.1" 200
+2026-09-28 00:02:33,522 INFO    httpx HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/veo-3.1-fast-generate-preview:predictLongRunning "HTTP/1.1 400 Bad Request"
+2026-09-28 00:02:33,524 ERROR   rhyme_server [task 584f1050] FAILED: scene 584f10501cf24ceca6dec7d8425517b9 failed on attempt 1: ClientError("400 INVALID_ARGUMENT. {'error': {'code': 400, 'message': 'API key not valid. Please pass a valid API key.', 'status': 'INVALID_ARGUMENT', 'details': [{'@type': 'type.googleapis.com/google.rpc.ErrorInfo', 'reason': 'API_KEY_INVALID', 'domain': 'googleapis.com', 'metadata': {'service': 'generativelanguage.googleapis.com'}}, {'@type': 'type.googleapis.com/google.rpc.LocalizedMessage', 'locale': 'en-US', 'message': 'API key not valid. Please pass a valid API key.'}]}}")
+2026-09-28 00:02:36,218 INFO    uvicorn.access 127.0.0.1:50376 - "GET /api/v1/tasks/584f10501cf24ceca6dec7d8425517b9 HTTP/1.1" 200

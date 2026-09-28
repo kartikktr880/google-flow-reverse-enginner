@@ -1,0 +1,13 @@
+C:\Users\Administrator\google-flow\server.py:103: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  @app.on_event("startup")
+INFO:     Started server process [13060]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8080 (Press CTRL+C to quit)
+INFO:     127.0.0.1:50124 - "GET /health HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:50125 - "POST /api/v1/characters/create HTTP/1.1" 422 Unprocessable Entity

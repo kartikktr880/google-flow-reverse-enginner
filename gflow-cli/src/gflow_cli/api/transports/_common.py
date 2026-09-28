@@ -1,0 +1,799 @@
+"""Shared constants and helpers for image transport strategies.
+
+Per spec § 5.4, all strategies share: the Flow URL, per-call timeout,
+batch_id minting, and response interpretation. Extracted here to avoid
+duplication across evaluate_fetch.py, bearer.py, and sapisidhash.py.
+
+Council edit (Claude, 2026-05-11): _FLOW_URL was about to be triplicated
+across B.1/B.2/B.3 and interpret_response() duplicated in B.2/B.3.
+Extracted before strategies are written so the duplication never lands.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import uuid
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
+
+import structlog
+
+from gflow_cli.api import routes
+from gflow_cli.api.dto import GeneratedImage
+from gflow_cli.data.redaction import redact_error_detail
+from gflow_cli.errors import (
+    AuthExpiredError,
+    ContentPolicyError,
+    FlowAccessUnavailableError,
+    FlowAccountChooserError,
+    FlowApiError,
+    FlowAppError,
+    FlowHostMigratedError,
+    NetworkError,
+    RateLimitError,
+    WafRejectionError,
+    WireFormatError,
+    classify_content_safety,
+)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+if TYPE_CHECKING:
+    from playwright.async_api import APIResponse
+
+log = structlog.get_logger(__name__)
+
+FLOW_URL: str = "https://labs.google/fx/tools/flow?hl=en"
+PER_CALL_TIMEOUT_S: int = 30
+BEARER_DEFAULT_TTL_S: int = 3600
+REFRESH_SAFETY_MARGIN_S: int = 60
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def mint_batch_id() -> str:
+    """Return a fresh UUID4 string for use as a batch request identifier."""
+    return str(uuid.uuid4())
+
+
+# Flow's own origins. Google is migrating accounts off labs.google onto
+# flow.google.com (issue #639). The handoff is a server-assigned per-account
+# boolean that the labs.google app acts on client-side after a fully
+# authenticated load (spike 2026-09-04-migrated-host-handoff-mechanism) -- it is
+# a one-way rollout, not a flap (5/5 and 7/7 on a flagged account). Both hosts
+# stay in this map because the fleet is mid-rollout.
+_FLOW_HOSTS: dict[str, str] = {
+    "labs.google": "labs",
+    "flow.google.com": "migrated",
+}
+
+
+def flow_host_kind(url: object) -> str | None:
+    """Classify a URL's origin as ``"labs"``, ``"migrated"``, or ``None``.
+
+    Exact host match over a parsed https URL — never a substring test, which any
+    foreign URL satisfies just by mentioning the host in its path or query.
+
+    Total by construction: both callers read this straight off ``page.url`` on
+    best-effort paths where a probe error must never displace the real failure,
+    so anything unparseable — or not even a string — classifies as ``None``.
+    """
+    if not isinstance(url, str):
+        return None
+    try:
+        parts = urlsplit(url)
+        if parts.scheme != "https":
+            return None
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return None
+    return _FLOW_HOSTS.get(host)
+
+
+#: NextAuth mounts Flow's OAuth routes on the *app's own origin*, so a host check
+#: passes straight through them: `/fx/api/auth/callback/google?...` and
+#: `/fx/api/auth/signin?error=Callback` are both `labs.google`. Verified in
+#: `auth/internal_chromium.py`, which is where this constant used to live —
+#: privately, and used only to gate a session poll, so no transport could see it.
+#:
+#: It matches the whole `/fx/api/auth/` family, NOT just `/signin` — callback and
+#: `/session` too — so anything derived from it must not claim "the sign-in page".
+#: NOTE: `auth/internal_chromium.py::_is_safe_to_probe_session` gates the login
+#: session poll on `flow_landing_kind(...) != "signin"`. Reclassifying a NextAuth
+#: path here re-opens the cookie-rotation hole that poll exists to avoid (#769).
+_NEXTAUTH_ROUTE_PREFIX = "/fx/api/auth/"
+
+
+def flow_landing_kind(url: object) -> str | None:
+    """Name a known **non-app** landing on a Flow origin: ``"signin"``, ``"public"``, or ``None``.
+
+    :func:`flow_host_kind` answers *which Flow origin*; this answers *whether the
+    origin served the app at all*. They are different questions, and conflating them
+    is how a sign-in error page and a project editor became indistinguishable —
+    `/about`, `/project/<id>` and `/fx/api/auth/signin?error=Callback` all pass a
+    host check, so a readiness wait that missed had nothing left to blame but its own
+    anchor (#756, #773, the 2026-09-10 RED canary).
+
+    ``None`` means **"nothing recognised"**, never "this is the app". A caller may
+    only use a positive answer to REPLACE a diagnosis it was already about to make.
+    Never call this ahead of a probe to decide whether to look: a fail-fast that runs
+    before the evidence is collected deletes the evidence that would correct it
+    (`skills/spike/SKILL.md`), and `page.url` read too early misses Flow's redirect
+    entirely, because it is client-side and lands after ``goto`` returns (#639).
+
+    ``"chooser"`` and ``"signin"`` also cover ``accounts.google.com`` — Google's auth
+    host, which is not a Flow origin but IS a known place to land. Reaching it mid-run
+    is measured, not theoretical (2026-09-10, profile ``denon82``): the session hopped
+    there after bootstrap and the labs gallery sweep reported a missing CTA on Google's
+    sign-in page. The rejected-browser route keeps returning ``None`` — it has its own
+    error and must never read as a missing account or an expired session.
+
+    ``"public"`` is deliberately scoped to the **migrated** host: `/about` was measured
+    there (#756) and nowhere else, and the remediation text names `flow.google.com`.
+    A `labs.google/about` landing would be a different, unmeasured thing, so it stays
+    ``None`` and the caller's own diagnosis stands rather than a message about the
+    wrong host.
+
+    Not measured, and so not encoded: whether a NextAuth route can carry a locale
+    segment (`/fx/pt/api/auth/...`). `routes.py` shows Flow does that for the app's
+    own paths. A non-EN profile would settle it; until then the prefix stays exact,
+    exactly as ``internal_chromium`` had it.
+
+    Total by construction, like its sibling: anything unparseable — or not even a
+    string — is ``None``, so a probe error can never displace the real failure.
+    """
+    if not isinstance(url, str):
+        return None
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    if parts.scheme != "https":
+        return None
+    host = (parts.hostname or "").lower()
+    path = parts.path
+
+    # Google's own auth host. Measured live on 2026-09-10: a session can hop here
+    # MID-RUN, after bootstrap has already passed, and `_enter_editor` then sweeps
+    # for a "+ New project" CTA on Google's sign-in page and reports the anchor.
+    # `client._handle_account_chooser` covers the bootstrap hop and only that, so
+    # this file's first version returned None here on the reasoning "the chooser has
+    # its own handler" — true at bootstrap, false everywhere else.
+    if host == "accounts.google.com":
+        # The bot-rejection hop. Path-tested rather than importing
+        # `auth.internal_chromium.GOOGLE_REJECTED_BROWSER_ROUTE`: `_common` -> `auth`
+        # is a real import cycle (`_common` reaches `profile_store`, which imports
+        # `gflow_cli.auth`), which is why that module imports THIS one deferred.
+        # It has its own error and must never read as a missing account or an
+        # expired session — same exclusion `client._handle_account_chooser` makes.
+        if path.rstrip("/").endswith("/v3/signin/rejected"):
+            return None
+        return "chooser" if path.rstrip("/").endswith("accountchooser") else "signin"
+
+    host_kind = _FLOW_HOSTS.get(host)
+    if host_kind is None:
+        return None
+    if path.startswith(_NEXTAUTH_ROUTE_PREFIX):
+        return "signin"
+    if host_kind == "migrated" and path.rstrip("/") == "/about":
+        return "public"
+    return None
+
+
+#: Google's account-index path segment, e.g. `/u/8/unavailable`. Collapsed rather
+#: than dropped: the shape is worth seeing in a bug report, the ordinal is not.
+_ACCOUNT_INDEX_RE = re.compile(r"/u/\d+/")
+
+
+def safe_page_url(url: object) -> str:
+    """A page URL reduced to scheme+host+path — safe to put in a user-facing message.
+
+    Google's auth URLs carry `state`, `code_challenge`, `client_id`, and challenge
+    tokens (`TL=...`) in the query. Error text is the artifact users are asked to paste
+    into GitHub issues, so the query and fragment have no business in it. Measured live
+    on 2026-09-10: a real `gflow image t2i` failure printed all of those.
+
+    Google's account-index segment (`/u/8/`) is collapsed to `/u/N/` for the same
+    reason. It is not an address, but it is account-correlatable — it says how many
+    accounts that browser session holds — and it is never diagnostic: gflow has no
+    `/u/N` handling anywhere, so the number tells a reader nothing it could act on.
+    `redact_error_detail` has no rule for it, so without this the segment would also
+    persist verbatim into the failed-operation row.
+
+    Anything unparseable comes back as the empty string rather than raising — this is
+    only ever called while another failure is already being reported.
+    """
+    text = str(url or "")
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return ""
+    if not parts.scheme or not parts.netloc:
+        return text
+    return f"{parts.scheme}://{parts.netloc}{_ACCOUNT_INDEX_RE.sub('/u/N/', parts.path)}"
+
+
+#: Flow's own component for "this account cannot use Flow". Measured 2026-09-15 on a
+#: new free Google account (`scripts/dev/spike_flow_unavailable_signal.py`): the shell
+#: renders `aisandbox-root > router-outlet > flow-pinhole-unavailable-screen`.
+#:
+#: A component tag, not a path, and not a status. The spike found no entitlement field
+#: on the wire; `flow.google.com/` answers **200** with the hop done client-side, so
+#: there is no 3xx to read; and the path is not stable — `/unavailable` and
+#: `/u/8/unavailable` were both observed on one account, the latter carrying Google's
+#: account-index segment. The component is the only anchor that survives all three,
+#: and it is locale-invariant by construction (AGENTS.md Tier 1).
+UNAVAILABLE_SCREEN = "flow-pinhole-unavailable-screen"
+
+
+async def _shows_unavailable_screen(page: object) -> bool:
+    """True when Flow has rendered its unavailable screen on `page`.
+
+    Total by construction, like its URL-reading siblings: a probe that fails is a probe
+    that saw nothing, never one that displaces the caller's own diagnosis — which is the
+    failure it is being called from the middle of. The cost of failing closed is that the
+    caller's exit-23 report stands, i.e. exactly today's behaviour, so the log line below
+    is the only way a dead locator engine is ever visible.
+    """
+    # Annotated Any deliberately: `page` is typed `object` for the same reason the URL
+    # siblings are, and pyright cannot see `.locator` on it. The try covers a page that
+    # has no locator at all (the attribute-less stubs in tests/test_errors_classification).
+    p: Any = page
+    try:
+        return bool(await p.locator(UNAVAILABLE_SCREEN).count() > 0)
+    except Exception as exc:  # noqa: BLE001 - a probe that fails is a probe that saw nothing
+        log.debug("ui_driver.unavailable_probe_failed", error=type(exc).__name__)
+        return False
+
+
+async def raise_if_known_landing(page: object, *, requested: str, at: str) -> None:
+    """Replace an about-to-be-raised drift report when the page is a **known landing**.
+
+    Call this from **inside a failure branch**, at a point where the caller is already
+    committed to raising — after a readiness wait has timed out, never before it. Two
+    reasons, both learned the hard way: a guard placed ahead of the probe deletes the
+    evidence that would correct it (`skills/spike/SKILL.md`), and Flow's hop to a
+    landing page is client-side, so ``page.url`` read right after ``goto`` is read too
+    early and sees nothing (#639). By the time the wait has failed, the URL has settled
+    and is simply true.
+
+    Returns silently when nothing is recognised, which is the common case and means the
+    caller's own diagnosis stands. **It does not follow that the call is safe anywhere:**
+    put it in a branch that can still recover and it converts a recoverable state into a
+    raise. `migrated_composer.ensure_editor`'s ``except`` has such a recovery path — the
+    call sits before it because agent-mode recovery cannot succeed on a landing page,
+    which is a property of THAT branch, not of this function.
+
+    ``requested`` is what the caller asked Flow for; the whole complaint in #756 is that
+    the operator could not tell what was asked for and what arrived.
+
+    The URL is stripped to scheme+host+path before it goes anywhere. The NextAuth family
+    includes `/fx/api/auth/callback/google?state=...&code=...`, and this message is the
+    artifact users paste into issues — an auth code is single-use, but it has no business
+    being in it.
+    """
+    url = str(getattr(page, "url", "") or "")
+    safe = safe_page_url(url)
+
+    # Checked before the URL kinds, and by DOM rather than path. This state is
+    # invisible to `flow_landing_kind`: the unavailable screen is served from a Flow
+    # origin on an ordinary path, so the URL half returns None and the caller's drift
+    # diagnosis stands. Measured as an A/B on 2026-09-15 with this probe neutered: the
+    # caller reported exit 23, "Google may have updated their frontend — file a bug",
+    # and wrote an incident bundle holding a screenshot of the user's own account page,
+    # for an account that simply has no Flow subscription.
+    if await _shows_unavailable_screen(page):
+        log.info(
+            "ui_driver.known_landing", at=at, kind="unavailable", url=safe, requested=requested
+        )
+        raise FlowAccessUnavailableError(
+            detail=(
+                f"Flow served its unavailable screen ({safe}) instead of {requested} — "
+                f"this Google account cannot reach Flow at all. Not selector drift, and "
+                f"not a session problem: the app loaded and routed to the screen it "
+                f"renders for an account without access."
+            ),
+            # Measured, not a class default: the screen renders on every visit for
+            # this account, and no login can grant access that was never purchased.
+            retryable=False,
+        )
+
+    kind = flow_landing_kind(url)
+    if kind is None:
+        return
+    log.info("ui_driver.known_landing", at=at, kind=kind, url=safe, requested=requested)
+    if kind == "chooser":
+        # The existing class for "we are at the chooser and cannot proceed" (#763/#764,
+        # exit 38). Path-only, so no DOM probe is needed here — the bootstrap handler
+        # does the `[data-email]` work and this is the raise for a hop that never
+        # reaches it.
+        raise FlowAccountChooserError(
+            detail=(
+                f"Google's account chooser is displayed ({safe}) instead of "
+                f"{requested} — the session needs a person to pick an account. "
+                f"Not selector drift."
+            )
+        )
+    if kind == "signin":
+        raise AuthExpiredError(
+            detail=(
+                f"Flow served one of its OAuth/sign-in routes ({safe}) instead of "
+                f"{requested} — this session is not signed in to Flow on that host, so "
+                f"none of the controls gflow drives are on the page. Not selector drift."
+            )
+        )
+    # Deliberately says WHAT arrived and stops. #756 measured the redirect and did not
+    # measure its cause — `gflow auth status` reports the session verified while this
+    # happens — so naming one here would just be a second confident wrong diagnosis.
+    raise FlowAppError(
+        detail=(
+            f"Flow redirected to its public landing page ({safe}) instead of "
+            f"{requested}. gflow cannot tell from here why it declined — this account "
+            f"may not have access to that project on this host. It is not selector "
+            f"drift, and no gflow-cli release changes it."
+        ),
+        # MEASURED, as of 2026-09-11: 5/5 consecutive attempts over ~3 minutes on a
+        # live occurrence all landed here, on the account's own project, with a healthy
+        # session. A retry is doomed for an account in this state and costs ~35 s each.
+        # (This was a PRESERVED default until that run — the 2026-09-10 spike got 0/5
+        # because the redirect had stopped reproducing. See
+        # docs/superpowers/spikes/2026-09-11-about-redirect-is-stable-for-an-account.md.)
+        retryable=False,
+    )
+
+
+def migrated_route(url: object, flow_host: str, *, prefer_migrated: bool = False) -> str:
+    """Which driver a page gets: ``"labs"``, ``"migrated"`` or ``"blocked"``.
+
+    ``flow_host`` is ``Settings.flow_host``. ``flow.google.com`` forces the migrated
+    composer; ``labs.google`` refuses it, so an account served the new host keeps
+    exit 36 (``blocked``). ``auto`` — the default — makes flow.google.com the default
+    host for every request it can serve (``prefer_migrated``, decided by the caller
+    from the request: t2v with a project today); anything else follows the host that
+    was actually served. An unreadable URL with nothing to prefer routes to the labs
+    driver, exactly as before.
+
+    **This function routes on the host SERVED, never on a property of the account.**
+    The distinction is not pedantry: a 2026-09-14 survey (3 accounts x 2 entry points
+    x 2 runs) found ``labs.google/fx/tools/flow`` answering **HTTP 308** every time,
+    while those same accounts differed in which capabilities worked. Host membership is
+    therefore uniform where capability is not, so it does not predict capability.
+
+    That says nothing about the labs arm below, which is reached for reasons that are
+    not about host membership at all — an unreadable URL, ``about:blank``, or any
+    request the caller did not prefer the migrated host for. Those are the common path,
+    not a legacy one. See
+    docs/superpowers/spikes/2026-09-14-two-domain-protocol-survey.md.
+    """
+    if flow_host == "flow.google.com":
+        return "migrated"
+    kind = flow_host_kind(url)
+    if kind == "migrated":
+        return "blocked" if flow_host == "labs.google" else "migrated"
+    return "migrated" if prefer_migrated and flow_host == "auto" else "labs"
+
+
+def raise_if_migrated(page: object, *, at: str) -> None:
+    """Abort now if this page is on the migrated ``flow.google.com`` origin (#639).
+
+    The labs drivers render none of their controls there, so every probe after this
+    point is doomed. Call it wherever the run is **about to spend time**, never behind
+    a wait of its own: ``page.url`` is a cached property that Playwright updates in
+    the same tick it emits the hop's ``framenavigated``, and :func:`flow_host_kind`
+    is one parse plus a dict lookup — the working host pays nothing. Once, at entry,
+    is not enough (v0.66.1's defect: the hop is a post-``goto`` client-side
+    navigation); re-check at every blocking point instead. History and measurements:
+    ``docs/superpowers/spikes/2026-09-04-migrated-host-handoff-mechanism.md``.
+
+    ``at`` names the call site in the log event so a field timeline shows where the
+    host became knowable.
+    """
+    url = getattr(page, "url", None)
+    if flow_host_kind(url) != "migrated":
+        return
+    log.info("ui_driver.migrated_host_bail", at=at, url=url)
+    raise FlowHostMigratedError(
+        detail=(
+            "Flow handed this session to flow.google.com — the origin Google is "
+            "migrating accounts onto — and this request is not ported to the migrated "
+            "composer yet (or GFLOW_CLI_FLOW_HOST=labs.google switched it off), so the "
+            "labs driver cannot proceed. This is not selector drift, and it is not "
+            "transient: the handoff is a per-account setting the labs.google app "
+            "applies on every load, so once your account is flagged, retrying will not "
+            "land the old frontend."
+        )
+    )
+
+
+PROJECT_URL_FRAGMENT = "/project/"
+
+
+def extract_project_id(url: str) -> str | None:
+    """Pull the project UUID out of a Flow editor URL, or None if absent.
+
+    Handles both ``/project/<uuid>`` and ``/project/<uuid>?query`` forms.
+    """
+    if PROJECT_URL_FRAGMENT not in url:
+        return None
+    try:
+        return url.split(PROJECT_URL_FRAGMENT)[1].split("?", maxsplit=1)[0]
+    except (IndexError, ValueError):
+        return None
+
+
+def interpret_response(strategy_name: str, resp: Any) -> list[GeneratedImage]:
+    """Map an httpx-like response (status_code + text) to images or raise.
+
+    The strategy_name is included in every error message for traceability
+    across S1/S2/S3 stack traces.
+
+    Exception mapping:
+      200 + valid non-empty media[]  → list[GeneratedImage]
+      200 + empty media[]            → ContentPolicyError
+      200 + missing/invalid media    → WireFormatError
+      200 + non-JSON body            → WireFormatError (chained from JSONDecodeError)
+      401                            → AuthExpiredError (caller handles refresh+retry)
+      403                            → WafRejectionError (fingerprint/auth mismatch)
+      429                            → RateLimitError
+      >=500                          → NetworkError
+      other                          → WireFormatError
+    """
+    status: int = resp.status_code
+    text: str = resp.text or ""
+
+    if status == 200:
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            msg = f"{strategy_name}: non-JSON response body: {_redacted_snippet(text)}"
+            raise WireFormatError(msg) from exc
+
+        media = payload.get("media")
+        if not isinstance(media, list):
+            msg = (
+                f"{strategy_name}: missing or invalid 'media' list in response: "
+                f"{_redacted_snippet(text)}"
+            )
+            raise WireFormatError(
+                msg,
+            )
+        if not media:
+            msg = f"{strategy_name}: empty media[] — content policy rejection"
+            raise ContentPolicyError(msg)
+        return GeneratedImage.from_response_dict(payload)
+
+    if status == 401:
+        msg = f"{strategy_name}: HTTP 401 from Flow API — session expired"
+        raise AuthExpiredError(msg)
+    if status == 403:
+        msg = (
+            f"{strategy_name}: HTTP 403 — likely WAF/fingerprint mismatch: "
+            f"{_redacted_snippet(text)}"
+        )
+        raise WafRejectionError(
+            msg,
+        )
+    if status == 429:
+        msg = f"{strategy_name}: HTTP 429 — rate limit hit: {_redacted_snippet(text)}"
+        raise RateLimitError(msg)
+    if status >= 500:
+        msg = f"{strategy_name}: HTTP {status} server error: {_redacted_snippet(text)}"
+        raise NetworkError(msg)
+
+    msg = f"{strategy_name}: unexpected HTTP status {status}: {_redacted_snippet(text)}"
+    raise WireFormatError(msg)
+
+
+GENERATION_POLICY_HINT: str = (
+    "Flow refused this generation (HTTP 400 on the generation route). This is "
+    "almost always a content-policy rejection, not a malformed request — on this "
+    "path Flow's own web app composes the request body. Most common causes, in "
+    "order: (a) more than ONE face-bearing reference in the same request — reduce "
+    "to a single --reference-entity OR a single portrait --ref and carry other "
+    "people in prose; (b) an age-explicit person descriptor in the prompt ('a "
+    "young woman in her early 20s', 'a man of about thirty') — use a relational "
+    "or role noun instead ('his adult granddaughter', 'an estate agent'); (c) a "
+    "real-person likeness or a frontal close-up face. Shortening the prompt does "
+    "NOT help."
+)
+
+
+#: Bounded because this is paid on a path that often has nothing to wait for.
+#: Measured: when Flow does redirect, it lands well inside this window; when it
+#: does not (an `en` account is served the bare URL and never redirected), the
+#: full timeout is dead time. 8 s made `ffroliva` setup take 11.2 s.
+URL_SETTLE_TIMEOUT_MS: float = 4_000.0
+
+#: Flow's canonical settled editor shape. Reuses the routes matcher rather than
+#: restating it: `_resolve_account_locale` waits on THIS and then parses with
+#: `routes.locale_segment_from_url`, so two independent copies could drift apart
+#: and silently switch locale resolution off while both log lines looked healthy.
+FLOW_LOCALISED_URL_RE = routes.LOCALE_SEGMENT_RE
+
+
+async def await_url_settled(page: Any) -> str | None:
+    """Wait for Flow's locale redirect to land; return the settled URL or ``None``.
+
+    ``page.goto(wait_until="domcontentloaded")`` returns BEFORE the redirect —
+    measured at 591-797 ms with the redirect arriving after. Any DOM work started
+    in that window runs against a page about to be navigated away, which is how
+    the #395 "character-route bounce" presents.
+
+    **Waits for the destination SHAPE, not for stability.** An earlier version
+    polled for two consecutive identical samples 200 ms apart and returned
+    immediately — before the redirect had begun — reporting a URL that was merely
+    not-yet-changed as "settled". The e2e gate caught it; unit tests could not,
+    because the bug is purely about real-world timing.
+
+    Two callers with independent purposes share this primitive: the client settles
+    the bootstrap navigation to LEARN the account locale (preventing the redirect
+    thereafter), the transport settles each editor navigation to TOLERATE a
+    redirect it did not predict. Prevention and tolerance stay independent; only
+    the act of observing "settled" is shared.
+
+    Best-effort: never raises. Returns ``None`` on timeout (already-localised URLs
+    match immediately, so a timeout means no locale form ever appeared).
+    """
+    # Short-circuit: if the URL is ALREADY the localised shape there is nothing to
+    # wait for. Measured: without this, every project navigation on a
+    # resolved-locale account burned the full timeout, because wait_for_url does
+    # not reliably return early for an already-matching current URL.
+    try:
+        current = str(page.url)
+    except Exception:  # noqa: BLE001
+        current = ""
+    if current and FLOW_LOCALISED_URL_RE.match(current):
+        return current
+    # #643: on the migrated origin the localised shape can NEVER appear — the path
+    # is /project/<id>, with no /fx/<locale>/tools/flow segment. Waiting for it
+    # burned the full timeout (measured 4018 ms on every migrated navigation) to
+    # return the None we can return now.
+    if flow_host_kind(current) == "migrated":
+        return None
+
+    try:
+        await page.wait_for_url(FLOW_LOCALISED_URL_RE, timeout=URL_SETTLE_TIMEOUT_MS)
+        return str(page.url)
+    except Exception as exc:  # noqa: BLE001 — observation only, never break navigation
+        # Distinguish "no localised URL appeared" (expected on accounts Flow does
+        # not redirect) from "the wait itself is broken" (e.g. a renamed
+        # Playwright method). Collapsing both into a silent None would let a
+        # permanently broken settle read as healthy forever — the caller logs
+        # `url_stable_after_goto` on a None return.
+        log.info(
+            "transport.url_settle_gave_up",
+            exc_class=type(exc).__name__,
+            timeout_ms=URL_SETTLE_TIMEOUT_MS,
+        )
+        return None
+
+
+def generation_error(*, status: int, route: str, body: object) -> FlowApiError:
+    """Classify a non-2xx status on a Flow **generation** route (issue #528).
+
+    Returns the exception rather than raising it: the single-prompt paths do
+    ``raise generation_error(...)``, while ``generate_images_batch`` needs the
+    object to hand back inside a per-prompt ``BatchSubmissionResult``.
+
+    Callers reach here only after 401/403/429 have been branched off, and only
+    when no image/media survived — so this decides between "Flow refused the
+    content" and "we genuinely do not understand this response".
+
+    * 400 → :class:`ContentPolicyError`. Named ``reason`` when Flow sent one,
+      but a bare 400 counts too: on the ``ui_automation`` path the generation
+      request body is composed by Flow's own web app, so a 400 there cannot be
+      our malformation. Before #528 these surfaced as ``WireFormatError``
+      telling operators to "retry with a simpler prompt text", which never works.
+    * any other status → :class:`WireFormatError`, unchanged.
+    """
+    if status == 400:
+        reason = classify_content_safety(body)
+        detail = f"HTTP 400 on {route or 'the generation route'}: Flow refused the request " + (
+            f"on content-safety grounds (reason={reason})"
+            if reason
+            else "— no reason field returned (see remediation for the usual causes)"
+        )
+        return ContentPolicyError(
+            detail=detail,
+            status=400,
+            route=route,
+            remediation_hint=GENERATION_POLICY_HINT,
+        )
+    return WireFormatError(
+        detail=f"generation route returned HTTP {status}",
+        status=status,
+        route=route,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Signed-media download (#895)
+# ---------------------------------------------------------------------------
+
+#: Attempts the driver makes at a signed-media GET. Playwright takes the number of
+#: *retries*, so it is passed ``_DOWNLOAD_ATTEMPTS - 1``. Matches ``_retry.py``'s
+#: ``MAX_ATTEMPTS = 3``, so the two retry layers in this codebase agree without tuning.
+_DOWNLOAD_ATTEMPTS = 3
+
+#: Per-GET budget. Unchanged from before the retry landed, because the driver charges its
+#: backoff to this same budget rather than restarting it per attempt — measured, see
+#: ``docs/superpowers/spikes/2026-09-22-playwright-max-retries-econnreset.md``.
+_DOWNLOAD_TIMEOUT_MS = 180_000
+
+
+async def get_signed_media(
+    page: Any,
+    url: str,
+    *,
+    media_id: str,
+    route: str,
+    max_redirects: int,
+    remediation: str,
+) -> APIResponse:
+    """GET a signed media URL, surviving a transient connection reset (#895).
+
+    Every caller reaches here **after** Flow has already reported the generation done, so
+    a failure at this point discards an artifact the user has already been billed for. Two
+    things follow, and both are the point of this helper existing rather than three
+    hand-rolled copies:
+
+    * **The transfer is retried.** ``max_retries`` is Playwright's own — it matches on the
+      driver's ``e.code === "ECONNRESET"`` and never on an HTTP status, and its backoff is
+      charged to this call's timeout so three attempts stay inside one budget rather than
+      tripling it. Measured, with an A/B control, in the spike above.
+    * **A reset that outlives the retries is typed.** Unhandled, ``playwright`` raises a
+      class that is not a :class:`GFlowError`, which renders as *"Unexpected error … exit 1,
+      retryable: False"* — three statements, of which the last two are wrong and the first
+      is useless. :class:`NetworkError` is retryable, exits 6, and carries *remediation*,
+      which is where the caller says how to get the clip back.
+
+    ``detail`` deliberately carries the exception's **class name only**. Playwright
+    concatenates its server-side call log — including the request URL — into the message,
+    and a signed URL is a credential: ``detail`` reaches stderr and ``--json`` stdout
+    without passing through redaction.
+
+    The status check stays with the caller. Retrying is for a connection that died; a
+    response that arrived is an answer, and re-asking will not change it.
+    """
+    from gflow_cli.api._engine import retryable_engine_errors  # noqa: PLC0415 - import cycle
+
+    try:
+        return await page.request.get(
+            url,
+            timeout=_DOWNLOAD_TIMEOUT_MS,
+            max_redirects=max_redirects,
+            max_retries=_DOWNLOAD_ATTEMPTS - 1,
+        )
+    except retryable_engine_errors() as exc:
+        log.warning(
+            "media.download_transport_failed",
+            media_id=media_id,
+            attempts=_DOWNLOAD_ATTEMPTS,
+            error_class=type(exc).__name__,
+            route=route,
+        )
+        raise NetworkError(
+            detail=(
+                f"the signed media URL for {media_id} dropped the connection on all "
+                f"{_DOWNLOAD_ATTEMPTS} attempts ({type(exc).__name__})"
+            ),
+            remediation_hint=remediation,
+            route=route,
+        ) from exc
+
+
+def recoverable_clip_hint(media_id: str) -> str:
+    """What to tell someone whose *generation* finished but whose download did not."""
+    return (
+        f"The clip was generated and is safe in Flow — only the transfer failed, and the "
+        f"credits are already spent. Recover it for free with `gflow data download "
+        f"{media_id}`. Do not re-generate: that bills again for a clip you already own."
+    )
+
+
+def retry_the_recovery_hint(media_id: str) -> str:
+    """What to tell someone whose ``gflow data download`` transfer died.
+
+    "Run `gflow data download`" would be circular here — they just did. So it says what a
+    re-run actually changes, and names the cause that fits the reports.
+    """
+    return (
+        f"Nothing was lost and nothing was billed — {media_id} is still in Flow. Re-run "
+        "this command: each attempt restarts the transfer, and a reset that survived "
+        "every attempt usually clears on a fresh run. If it keeps failing, a VPN, "
+        "corporate proxy or antivirus interrupting large transfers is the usual cause."
+    )
+
+
+def expired_link_hint(media_id: str) -> str:
+    """Flow's signed links are short-lived; a late GET answers 4xx, not a reset."""
+    return (
+        f"Flow's signed link for this clip may have expired — they are short-lived. Run "
+        f"`gflow data download {media_id}`, which opens the clip's own route so Flow "
+        "issues a fresh link. No credits are spent."
+    )
+
+
+def _redacted_snippet(text: str) -> str:
+    """Redact-then-truncate a response body for an exception message.
+
+    Redaction runs BEFORE truncation (same rationale as
+    ``client._build_wire_format_discovery``, audit gap #11): a token clipped at
+    char 200 is still a partial secret, and since #341 these messages persist
+    to the catalog DB as ``error_detail``. Called only at raise sites so the
+    success path pays nothing.
+    """
+    return redact_error_detail(text)[:200]
+
+
+# ---------------------------------------------------------------------------
+# Model-picker primitives, shared by the image and video transports.
+#
+# Both arms drive a Radix `[role='menu']` of `[role='menuitem']` entries through
+# the SAME trigger selector, and both were bitten by the same two hazards:
+# `has-text` is a SUBSTRING match (so one label can be a prefix of another), and
+# a raw `count()` includes mounted-but-hidden nodes. Keeping one copy means a
+# fix on one arm cannot silently skip the other.
+# ---------------------------------------------------------------------------
+
+READ_MENU_ITEM_LABELS = r"""
+() => Array.from(document.querySelectorAll("[role='menuitem']"))
+    .map(e => (e.innerText || '').replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+"""
+
+
+async def offered_menu_labels(page: Any) -> list[str]:
+    """What the picker is rendering RIGHT NOW — read while the menu is open.
+
+    Included in every failure message: a bare "model not found" is unactionable,
+    whereas the actual list tells an operator immediately whether Flow renamed an
+    entry, removed it, or added a near-duplicate. Best-effort — diagnostics must
+    never mask the error they describe.
+    """
+    try:
+        return list(await page.evaluate(READ_MENU_ITEM_LABELS))
+    except Exception:  # noqa: BLE001
+        return []
+
+
+async def close_menu(page: Any) -> None:
+    """Leave no stray open UI behind after a refusal.
+
+    TWO Escapes, deliberately: the model menu and the generation-settings panel
+    beneath it. Raising out of a model select skips the caller's own panel-close,
+    so a single Escape leaves the panel open. In a batch that then toggles the
+    panel SHUT on the next prompt's open attempt, turning one drifted selector
+    into a whole-batch failure.
+    """
+    for _ in range(2):
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:  # noqa: BLE001, S110 — cleanup only
+            return
+
+
+async def count_visible(page: Any, selector: str) -> tuple[int, Any]:
+    """Number of VISIBLE matches for *selector*, plus the first of them.
+
+    `count()` alone counts mounted-but-hidden nodes. Radix keeps menus mounted,
+    so a stale or offscreen menu inflates the count and either forces a false
+    AMBIGUOUS or resolves to a node that cannot be clicked.
+    """
+    loc = page.locator(selector)
+    total = await loc.count()
+    matches = 0
+    first: Any = None
+    for i in range(total):
+        nth = loc.nth(i)
+        if await nth.is_visible():
+            matches += 1
+            if first is None:
+                first = nth
+    return matches, first

@@ -1,0 +1,490 @@
+# Model Context Protocol (MCP) Server for gflow-cli
+
+This document describes the design, configuration, security model, and developer setup for the `gflow-cli` MCP server.
+
+---
+
+## 1. Architecture
+
+The `gflow-cli` MCP server acts as a type-safe JSON-RPC interface, supporting two transport mechanisms:
+1. **stdio Subprocess Transport (`gflow mcp run`):** Runs over standard input/output (`stdio`), ideal for direct integration with local desktop agents like Claude Desktop, Cursor, or VS Code.
+2. **Streamable HTTP Transport (`gflow serve`):** Runs as a background web daemon over HTTP at `/mcp`, ideal for decoupled web UI dashboards, concurrent scripts, or external clients. The legacy HTTP+SSE transport remains available for one deprecation cycle via `gflow serve --transport sse`.
+
+### Protocol versions
+
+The server is built on the `mcp>=2` Python SDK and negotiates the protocol
+**per connection**, serving both eras from one binary:
+
+| Era | Versions | Notes |
+| :--- | :--- | :--- |
+| Handshake (legacy) | `2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25` | `initialize`/`initialized` exchange, `Mcp-Session-Id` |
+| Modern (stateless) | `2026-07-28` | No handshake, no session id; protocol version and client capabilities ride in `_meta` on every request |
+
+We write no protocol code for this — the SDK's low-level `Server.run` drives
+`serve_dual_era_loop`, and the client's first request decides the era.
+
+The 2026-07-28 stateless core costs us nothing structurally: the server holds no
+per-connection state. Cross-call continuity lives in SQLite (`gflow.db`) and the
+Chromium profile directory, keyed by the `profile` argument that every tool
+already takes — which is exactly the "server-minted handle passed as an ordinary
+tool argument" pattern the spec now prescribes. `ProfileLease` is a cross-process
+file lock, not a session, so it is unaffected. We use none of the features the
+spec deprecated (Roots, Sampling, Logging).
+
+**Dependency bound.** `pyproject.toml` pins `mcp>=2.0.0,<3`. The upper bound is
+mandatory, not cosmetic: MCP SDK majors carry breaking protocol-era changes
+(2.0.0 deleted `mcp.server.fastmcp` outright, which an unbounded `mcp>=1.0.0`
+happily resolved into — breaking every fresh install of this surface while CI
+stayed green on the lockfile). The `resolve-drift` CI job installs from the
+declared ranges *without* the lockfile and smoke-imports this surface, so the
+next such break fails CI instead of reaching users.
+
+**Response caching.** 2026-07-28 added `ttlMs`/`cacheScope` to list results. Our
+listing surfaces are decided at import time by decorators, so `tools/list`,
+`prompts/list`, and `resources/list` advertise a one-hour TTL. `resources/read`
+gets five minutes because it is not static — the known-issues resource reads
+`KNOWN_ISSUES.md` off disk. `cacheScope` is `private` throughout: gflow is a
+local, single-user daemon driving one user's authenticated browser profile, so
+`public` would authorize shared caching of user-scoped responses.
+
+```
+┌────────────────────────────────────────────────────────────┐
+│      Client AI Agent (Claude / Cursor / Web Dashboard)     │
+└─────────────┬───────────────────▲──────────────────────────┘
+              │ JSON-RPC          │ JSON-RPC
+              │ (stdio / HTTP)    │ (stdout / SSE)
+┌─────────────▼───────────────────┴──────────────────────────┐
+│        MCP Server Adapter (MCPServer / FastAPI app)         │
+│  Exposes: Tools, Prompts, Resources                        │
+└─────────────┬──────────────────────────────────────────────┘
+              │ internal calls
+              ▼
+┌────────────────────────────────────────────────────────────┐
+│                       gflow-cli Core                       │
+│  - FlowApiClient (Playwright / REST requests)               │
+│  - SQLite operations catalog (DataStore)                   │
+├──────────────────────────────┬─────────────────────────────┤
+│   Chromium Profile Lock      │      Direct SQLite Read     │
+│   (asyncio & file-based)     │      (Fast read paths)      │
+└─────────────┬────────────────┴──────────────┬──────────────┘
+              │ writes cookies                │ queries history
+              ▼                               ▼
+     [profile_<name>/]                  [gflow.db]
+```
+
+### Adapters side-by-side
+Both Click CLI (`src/gflow_cli/cli.py`) and MCP Server (`src/gflow_cli/mcp/`) are thin adapter layers that drive the core application services (`FlowApiClient` and `repository.py`), ensuring zero duplication of business logic.
+
+---
+
+## 2. Tools, Prompts, and Resources
+
+The server registers three protocol surfaces:
+
+### Tools (Executable actions)
+* `gflow_generate_image(prompt, model, aspect, count, seed, reference_images, reference_entities, reference_entity_names, tools, profile, project, project_name, instructions, ui_mode, output, wait)`: Triggers text-to-image / image-to-image (Imagen / Nano Banana). `instructions` is an optional list of ephemeral agent-instruction strings (agentic cohort only). `reference_images` switches to i2i and accepts **either a local file path or a generated image's Flow media UUID**. A UUID reference is attached by **selecting the already-existing asset in Flow's reference picker — no duplicate copy is uploaded** (locating the tile by the media id in its thumbnail URL, and searching the recorded display name to surface it when needed); gflow falls back to uploading the asset's on-disk local file only when it can't be located in place (e.g. it lives in a different project's picker). `project` generates into an existing Flow project id (mirrors CLI `--project`) — pass the reference's project to keep it selectable in place. `ui_mode` selects the Flow UI arm (`auto`/`classic`/`agentic`, mirroring CLI `--ui-mode`, matched case-insensitively). Since [#595](https://github.com/ffroliva/gflow-cli/issues/595) `auto` means "no arm was asked for" and **resolves to `classic`** — the arm that can satisfy an image request — so an account in Flow's agentic cohort aborts pre-submit (exit-28 equivalent envelope, zero credits) instead of failing mid-run with selector drift or video bytes; the agentic arm is bound only when named. Passing `instructions` forces `agentic` automatically, so `ui_mode="classic"` + `instructions` is a hard conflict rather than a silent drop. An unknown value returns a 400 problem-details envelope. See [CONFIGURATION § GFLOW_CLI_UI_MODE](CONFIGURATION.md#gflow_cli_ui_mode).
+  On migrated `flow.google.com` accounts, T2I and local-file I2I are supported with Nano Banana 2 / Pro, all five aspects (16:9, 4:3, 1:1, 3:4, 9:16) and count 1–4; the page owns reCAPTCHA and the `ogiZ0b` submit. UUID/entity references, instructions and Imagen 4 remain pre-submit refusals there. The queued (`wait=false`) and blocking (`wait=true`) calls use the same typed payload and worker path.
+* `gflow_generate_video(prompt, mode, aspect, initial_frame, end_frame, reference_images, reference_entities, reference_entity_names, model, duration, resolution, count, tools, profile, project, project_name, ui_mode, output, wait)`: Triggers vertical or landscape video generation (Veo). `mode` is `t2v`/`i2v`/`r2v`; `model` (`veo_lite`/`veo_fast`/`veo_quality`/`omni_flash`, aliases accepted), `duration` (seconds — 4/6/8 for Veo 3.1 and 4/6/8/10 for omni_flash; 10 is omni_flash-only), `resolution` ('360p' or '720p', supported on omni_flash). **Whether Flow renders a duration control at all is account/cohort-dependent**: on an account that renders none, the job is accepted here and fails in the worker pre-submit (exit 23 equivalent on the labs driver, exit 11 equivalent on the migrated `flow.google.com` host — now the default t2v route, #650 — no credits spent either way) rather than being rejected up front — see [KNOWN_ISSUES](https://github.com/ffroliva/gflow-cli/blob/main/KNOWN_ISSUES.md) (#451/#288/#630), and `count` mirror the CLI `gflow video` flags — an omitted `model` lets the transport apply its i2v veo-lite default (issue #125), and every model — `omni_flash` included — accepts i2v with a start frame and with an end frame (wire-verified 2026-09-02, issue #626); `i2v` requires `initial_frame`, `r2v` requires `reference_images` **or** `reference_entities`; `project` generates into an existing Flow project id (mirrors CLI `--project`); on an account Google has moved to `flow.google.com` (`GFLOW_CLI_FLOW_HOST`, read from the server/daemon environment, not per call — see [CONFIGURATION § GFLOW_CLI_FLOW_HOST](CONFIGURATION.md#gflow_cli_flow_host)) omitting `project` creates one there first (#864); there the ported modes are text-to-video; image-to-video with a **local** `initial_frame`, optionally with a **local** `end_frame` (start+end interpolation, #639) (the file is uploaded through the editor and bound on the Start chip by display name — it stays in the Flow project like any upload, under a **run-unique** name: `hero.png` is listed as `hero-a1b2c3d4.png`, so a re-run cannot bind an earlier upload — [#792](https://github.com/ffroliva/gflow-cli/issues/792)); and reference-to-video with local `reference_images` (each file is uploaded the same way — run-unique name included — and attached as an `@` mention of *that* name in the prompt; `duration` there accepts only `8` and is pinned when omitted — Flow offers r2v at its base tier alone, and at 4 or 6 it silently drops the references and bills a text-to-video clip, so any other value returns the exit-11-equivalent envelope). A Flow media UUID as `initial_frame` or `end_frame`, and `r2v` by `reference_entity_names` or `reference_entities`, return the exit-36-equivalent envelope; a **local-file** `end_frame` is ported (#639). `initial_frame`, `end_frame`, and `reference_images` each accept **either a local file path or the Flow image UUID of a generated asset** — pass a generated image's id straight in to chain image→video, and gflow attaches it for you. Since v0.58.0 (#529) the CLI and MCP surfaces are unified for i2v frames: the UUID keeps its identity and is enriched with the catalog's recorded display name plus an integrity-verified local fallback, so the transport prefers **selecting the exact asset in the project's media picker** (no duplicate upload) and re-uploads the recorded local file only when the tile is unreachable — and only if its byte count/SHA-256 still match. A UUID that isn't in your local asset catalog is rejected up front with a clear "Reference Not Found" error; a catalogued asset with neither a display name nor a verified local file gives a "Reference Not Usable" error (re-generate it or pass a local path). `r2v` UUID refs are resolved to the recorded local file for upload. `ui_mode` selects the Flow UI arm (#299 PR-A, mirroring CLI `--ui-mode`) and **applies to every mode of this tool, including `r2v`** — unlike the CLI, where `video r2v`/`chain` have no flag and follow the env-only path. Video generation has **only a classic driver**, so `auto` ≡ `classic`: both verify the classic editor pre-submit and abort before spending credits if it is unreachable. `ui_mode="agentic"` is rejected with a 400 problem-details envelope, because no agentic video driver exists yet. Values are matched case-insensitively. (MCP tools return envelopes, never process exit codes — the CLI equivalents of these aborts are exit 28 and exit 2 respectively.) See [CONFIGURATION § GFLOW_CLI_UI_MODE](CONFIGURATION.md#gflow_cli_ui_mode).
+
+> **Attaching a saved character (the identity axis).** Three routes reach Flow's
+> `referenceEntities` wire and they dedupe against each other: an `@Name` mention inside
+> the prompt, `reference_entities` by entity id, and `reference_entity_names` as the
+> optional display names paired with those ids. Prefer the **id** when a display name
+> could be ambiguous — Flow does not enforce unique names. `reference_images` is a
+> different axis entirely: it buys a *look*, not an identity. Use
+> `gflow_character_list` to discover ids. See [REFERENCE_STRATEGIES](REFERENCE_STRATEGIES.md).
+
+* `gflow_auth_status(profile)`: Credit-free, non-interactive Flow session probe (#497) — wraps the same fail-closed `verify_flow_profile` check as `gflow auth status`. Returns `{"status": "authenticated", "profile", "user_email"}` or a problem-details error with a `remediation_hint`; a `verification_error` outcome (HTTP 503, `retryable: true`) means a network/endpoint problem, which re-login does not fix, and a `profile_marker_missing` outcome (HTTP 409, `retryable: false`, #796) means the profile lost its `.gflow_browser_strategy` marker so its cookies cannot be read — neither a retry nor a re-login helps; re-run `gflow auth login --browser chrome` for that profile. Any other unauthenticated outcome is a dead session (HTTP 401). Call it before a generation tool to fail fast on dead auth (the queue is async — without it, an auth failure surfaces only later from the daemon). Login/logout remain CLI-only (genuinely interactive).
+* `gflow_get_credits(profile, all_profiles)`: Read-only current Flow balance query. With `all_profiles=true`, inspects every saved profile sequentially and preserves successful balances plus `total_credits` when another profile fails. This tool spends no credits and returns no cookies, bearer tokens, or browser API keys. The balance funds Veo video generation; image generation uses separate per-model daily quotas. **Not available where Flow serves `flow.google.com`:** that host's session mints no labs.google API token, so no balance can be read — the tool reports that the labs session returned no access token, which is expected there and is not an auth fault. Open, tracked in #795.
+* `gflow_character_list(project, profile)`: Lists a project's saved Flow CHARACTER entities with their **entity ids** — read-only, spends no credits, drives a browser session. This is how an agent discovers what it can attach: an `entity_id` goes to `reference_entities`, a `display_name` can be used as an `@Name` mention. An empty list means the project genuinely has none.
+* `gflow_character_show(project, entity_id, name, profile)`: Shows one character by id or exact display name (exactly one selector required). An ambiguous name is refused rather than resolved arbitrarily — which is the reason to prefer the id. Read-only; drives a browser session.
+* `gflow_character_voices()`: Lists the preset voices available for Character TTS (name, description, sample URL). A static in-process lookup — no network, no browser, no profile, no cost. Call it to pick a valid voice name.
+* `gflow_list_projects(profile, limit, offset)`: Queries the SQLite catalog for recent generation folders, paginated — the response carries `count` (rows in this page), `offset`, `has_more`, and `next_offset` (pass it back as `offset` for the next page; `null` on the last page).
+* `gflow_download_media(media_id, out_dir, profile)`: Fetches an already-generated asset from Flow by its media ID and writes it to disk — the recovery path for a generation that was billed but whose download failed. Spends no credits. The bytes are verified against the size Flow reports before the file is written, and the catalog's `local_files` row is updated. Returns `path`, `bytes`, `media_id`, `workflow_id`, `project_id` and `profile`. The transfer retries a dropped connection internally ([#895](https://github.com/ffroliva/gflow-cli/issues/895)), so a failure marked `retryable` means pause and call again — not immediately, and not in a tight loop: each call opens a browser under a per-profile lease, and a second concurrent call fails on that lease instead (exit 11).
+* `gflow_list_tools()`: Lists the prompt tools (name/title/description/category) accepted by the generate tools' `tools` param.
+* `gflow_instructions_list(project, profile)`: Lists a project's persistent Agent-Mode instruction cards (live server brief; credits-free).
+* `gflow_instructions_add(project, title, text, refs, enabled, profile)`: Adds a persistent instruction card. Each ref is classified automatically — local image path → uploaded image reference, asset UUID → image reference, anything else → character id/name (mirrors CLI `instructions add --ref`).
+* `gflow_instructions_set_enabled(project, enabled, title|card_id, profile)`: Enables/disables one card selected by title or stable card id (covers CLI `instructions enable`/`disable`).
+* `gflow_instructions_rm(project, title|card_id, profile)`: Removes one card from the brief.
+* `gflow_instructions_toggle_mode(project, enabled, profile)`: Flips the brief-level master switch; cards are left untouched.
+* `gflow_instructions_apply(project, cards, profile)`: Declarative **full-sync** — REPLACES all cards with the given set (destructive; same entry shape as the CLI `instructions apply` file).
+
+CLI↔MCP parity is enforced programmatically: `tests/mcp/test_cli_parity.py` walks every CLI leaf command and fails when one has neither a mapped MCP tool nor an explicit exemption with a stated reason. Note the deliberate asymmetry: `gflow_generate_video` has **no** `instructions` param (unlike `gflow_generate_image`) because the video pipeline (`GenerateVideoRequest` / the worker) has no instructions support — agentic-video is a typed divergence, and a dead parameter would be silently dropped. Both `gflow_generate_image` and `gflow_generate_video` support an `output` parameter mirroring the CLI `-o`/`--output` flag (#414, #415), decoding explicit output destinations in the worker daemon. `gflow update` is a considered exemption, not a backlog item: the package manager would replace the venv under a live `gflow mcp run` and write its output onto the JSON-RPC stdout channel — the operator runs it and restarts the server. A read-only twin of `gflow update --check` would be harmless; it is the upgrade path if agents ever need version awareness beyond the `initialize` handshake.
+
+### Prompts (Orchestration templates)
+* `expand_prompt`: Helps the agent structure simple ideas into Google's official 5-component prompt formula (Subject + Action + Location + Composition + Style) before sending them to the generation tools.
+* `create_character`: Assists agents in defining face, body, and voice parameters for consistent subject generation.
+
+### Resources (Context feeds)
+* `gflow://docs/mcp-guide`: A specialized, agent-targeted guide instructing the LLM to use the registered MCP tools (rather than running raw shell wrapper commands).
+* `gflow://docs/known-issues`: Bounded index of KNOWN_ISSUES.md (titles + status, a few KB — #501); read `gflow://docs/known-issues/{slug}` for one issue's full text (capped at 16 KB). The old behavior injected the whole ~70 KB file per fetch.
+* `gflow://db/schema`: Exposes SQLite schema definitions, allowing agents to understand project and media tables.
+
+---
+
+## 3. The Dilemma: Why we need the MCP Server (vs. Pure Skill)
+
+We analyzed whether a terminal-driven CLI guided by a text skill (e.g., `skills/gflow-cli/SKILL.md`) is sufficient. The LLM Council concluded that the MCP server is fully justified for these reasons:
+
+| Dimension | Direct CLI via Terminal Execution | Native MCP Server Daemon |
+| :--- | :--- | :--- |
+| **Output Fragility** | Ephemeral `stdout`/`stderr` log outputs are fragile to format adjustments, progress bars, and ANSI colors. | Strictly structured JSON payloads containing explicit metadata and absolute output file URIs. |
+| **Process Lifecycle**| High process startup overhead (Python import latency) on every individual execution. | Warm daemon process. Retains active caching of database metadata. |
+| **Concurrency** | A second concurrent process against the same profile is rejected immediately by the cross-process `ProfileLease` with `ProfileLockedError` (exit code 11) — a clean fail-fast, never a crash, never a wait. Different profiles run fully in parallel. | Calls on one profile inside one server run one at a time — a second call waits for the first instead of failing. A profile held by a *different* process (a CLI run, another server) is waited out for up to 180 s (`GFLOW_CLI_LEASE_WAIT_SECONDS`, which a value you set yourself overrides) before `ProfileLockedError`; different profiles still run fully in parallel. |
+| **Error Handling** | Agent must scan logs for strings or parse exit codes to check status. | Strongly-typed JSON-RPC errors with mapped codes and clear remediation. |
+| **Transport Safety** | Volatile console printing. | Stdout is strictly isolated for JSON-RPC; all logs and warnings route to stderr. |
+
+### Error envelope
+
+MCP tool failures return a structured error object built from the same RFC 9457
+Problem Details as the CLI, plus a **`retryable`** boolean. `retryable: true`
+marks a transient failure a scheduler can re-run without operator intervention —
+WAF/reCAPTCHA bounce (`WafRejectionError`), rate-limit (`RateLimitError`),
+transport timeout (`TransportTimeoutError`), network blip (`NetworkError`), a
+dropped browser session (`BrowserSessionClosedError`), a Flow web-app crash
+(`FlowAppError`), an agentic-cohort flap (`FlowAgentUiError` — but see the
+agent-only exception in § 6.1, which overrides it to `false`), an unreachable
+UI arm (`UiModeUnavailableError`), and a partially-completed sync
+(`SyncPartialError`). That list is `errors.RETRYABLE_ERRORS`, but it is no longer
+the whole answer: `errors.is_retryable` consults the **instance** first, so a raise
+site can override its class. Two do today — Flow's `/about` redirect raises
+`FlowAppError` with `retryable: false`, and since 2026-09-11 that is a **measurement**, not a
+preserved default: caught during a live occurrence, 5/5 consecutive attempts over ~3 minutes
+landed on `/about` again, on the account's own project with a healthy session — so a retry is
+doomed and costs ~35 s each ([#756](https://github.com/ffroliva/gflow-cli/issues/756)). The
+second is the migrated **agent-only composer**, which raises `FlowAgentUiError` with
+`retryable: false` because which composer an account gets is server-assigned and does not
+flap ([#799](https://github.com/ffroliva/gflow-cli/issues/799)). The
+*cause*, and whether it ever clears, remain unmeasured.
+Read the flag off the envelope; never re-derive it from the class list.
+Everything
+else (auth, content-policy, configuration, security) is terminal
+(`retryable: false`): retrying the identical request fails the same way. This
+flag is the **same shared classification** the CLI `--json` payload and the
+worker-queue error record use (`errors.is_retryable`) — the three surfaces
+cannot drift. On a captured failure the envelope also carries a remote-safe
+`incident` object (`{id, capture_status}` only — never a local path); see
+[DEBUGGING § Automatic incident bundles](DEBUGGING.md#automatic-incident-bundles).
+
+Every tool routes through one error funnel. **Unexpected (non-gflow) exceptions
+are masked**: the client sees only the exception class name
+(`"Unexpected RuntimeError; details were logged server-side."`, `status: 500`,
+`retryable: false`) — raw exception text can embed filesystem paths, profile
+names, or token material and never leaves the server; the full message and
+traceback go to the server-side structured log (`mcp.tool.unexpected_error`).
+
+---
+
+## 4. Setup Instructions
+
+### Claude Code — the plugin (one step)
+
+```
+/plugin marketplace add ffroliva/gflow-cli
+/plugin install gflow@gflow-cli
+```
+
+This installs the `gflow-cli` and `video-production` skills **and** registers this MCP server,
+so there is nothing further to configure.
+
+> **It ships disabled on purpose.** Claude Code starts a plugin's MCP servers automatically
+> when the plugin is enabled — there is **no separate prompt for the server itself**. This server
+> drives your own signed-in Google account, and Veo video generation bills your credits. So the
+> plugin sets `defaultEnabled: false`: installing it does not start anything, and enabling it is
+> a deliberate act. Images and composition cost nothing; only video spends.
+>
+> The plugin also declares a required `userConfig` acknowledgement, which Claude Code prompts for
+> when you enable it in the UI. Be aware that it is a **prompt, not an enforcement gate** —
+> `claude plugin enable` on the command line succeeds without it. `defaultEnabled: false` is the
+> control that actually holds.
+>
+> **The hard guarantee, if you want one, is `--no-spend`.** It is not a policy the model is asked
+> to respect: the credit-spending tools are never registered, so they do not appear in
+> `tools/list` at all. Register the server yourself with `gflow mcp run --no-spend` (see the
+> manual setup below) instead of using the bundled entry.
+
+The plugin runs `gflow mcp run`, so `gflow` must be on your `PATH` (`uv tool install gflow-cli`)
+and you must have authenticated once with `gflow auth login --browser chrome`.
+
+> **Which revision you get.** `/plugin marketplace add ffroliva/gflow-cli` reads the marketplace
+> from the repository's **default branch**, which in this project is `develop` — the integration
+> branch, not the last release. So the plugin you install tracks `develop`, while the version
+> string in its manifest and the documentation links inside its skills both point at the last
+> released state. If you want a released revision, install from a tag instead of the default
+> branch, or use the manual MCP setup below and a pinned `gflow-cli` from PyPI.
+
+### Claude Desktop Integration
+Run the configuration helper command in your terminal:
+```bash
+gflow mcp setup
+```
+This merges the server entry into your Claude Desktop configuration file — existing content is preserved, and a pre-existing file is backed up as `<name>.gflow-backup` first. A corrupt config fails loud (exit 11) and is never overwritten:
+* **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+* **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+* **Linux:** `~/.config/Claude/claude_desktop_config.json`
+
+Other targets: `gflow mcp setup --target cursor` (`~/.cursor/mcp.json`) and `--target vscode` (the user-profile `mcp.json`, written with VS Code's `servers` + `"type": "stdio"` schema).
+
+> **Existing entries are preserved:** if your config already has a `gflow` or `gflow-cli` server entry (including the local-clone `uv --directory` variant below), `gflow mcp setup` leaves it completely untouched and reports "Already configured" — it only ever adds a missing entry.
+
+#### Manual Configuration
+Depending on how you installed `gflow-cli`, add one of the following configuration blocks under the `mcpServers` key of your `claude_desktop_config.json`:
+
+##### Option A: Global Installation (Recommended)
+Use this if you installed `gflow-cli` globally (e.g. via `uv tool install gflow-cli` or `pip install gflow-cli`):
+```json
+{
+  "mcpServers": {
+    "gflow-cli": {
+      "command": "gflow",
+      "args": [
+        "mcp",
+        "run"
+      ]
+    }
+  }
+}
+```
+
+##### Option A2: Read-only server
+
+Use this when the agent must never be able to spend credits (#496). The two
+credit-spending tools (`gflow_generate_image`, `gflow_generate_video`) are then
+**never registered**, so they do not appear in `tools/list` at all — invisible
+rather than refused. Every read-only tool stays available.
+
+```json
+{
+  "mcpServers": {
+    "gflow-cli": {
+      "command": "gflow",
+      "args": [
+        "mcp",
+        "run",
+        "--no-spend"
+      ]
+    }
+  }
+}
+```
+
+Setting `GFLOW_MCP_NO_SPEND=1` in the environment does the same thing and also
+covers `gflow serve`. `gflow mcp setup` writes the plain (spending) block above —
+add the flag or the env var yourself if you want the read-only server.
+
+##### Option B: Local Clone (Development)
+Use this if you cloned the repository locally and run it via `uv`:
+```json
+{
+  "mcpServers": {
+    "gflow-cli": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/path/to/gflow-cli",
+        "run",
+        "gflow",
+        "mcp",
+        "run"
+      ]
+    }
+  }
+}
+```
+
+### Cursor Setup
+1. Open Cursor Settings -> Features -> MCP.
+2. Click **+ Add New MCP Server**.
+3. Configure depending on your installation:
+   * **Global Installation:**
+     * **Name:** `gflow-cli`
+     * **Type:** `command`
+     * **Command:** `gflow mcp run`
+   * **Local Clone (Development):**
+     * **Name:** `gflow-cli`
+     * **Type:** `command`
+     * **Command:** `uv --directory /path/to/gflow-cli run gflow mcp run`
+
+### HTTP Daemon Setup (`gflow serve`)
+For decoupled clients, local web interfaces, or multi-process frontends, run the daemon as an HTTP service:
+```bash
+gflow serve --port 8000 --host 127.0.0.1 --profile default
+
+# Read-only daemon — the two credit-spending tools are never registered (#496):
+gflow serve --port 8000 --host 127.0.0.1 --profile default --no-spend
+```
+This serves the MCP server over **Streamable HTTP**, the current spec transport:
+* **Endpoint:** `http://127.0.0.1:8000/mcp`
+
+The legacy HTTP+SSE transport is still available for one deprecation cycle:
+```bash
+gflow serve --transport sse --port 8000   # deprecated; logs a warning
+```
+* **Connection endpoint (SSE stream):** `http://127.0.0.1:8000/sse`
+* **Command posting endpoint:** `http://127.0.0.1:8000/messages/`
+
+> **Deprecated:** the MCP 2026-07-28 spec reclassified HTTP+SSE as deprecated.
+> Prefer the default `--transport http`. The spec's lifecycle policy guarantees a
+> minimum twelve months between deprecation and removal.
+
+`stateless_http` is deliberately **not** enabled. The stateless core exists so
+servers can scale out across interchangeable instances; gflow's value is the
+opposite — a warm daemon holding one live Chromium profile, serialized by
+`ProfileLease`. The *protocol* is stateless either way; that flag only governs
+transport bookkeeping we want to keep.
+
+### Authentication
+
+Set `GFLOW_DAEMON_TOKEN` (alias `GFLOW_CLI_DAEMON_TOKEN`) and **every** request
+to the daemon must present it:
+
+```http
+Authorization: Bearer <token>
+```
+
+A missing header, a non-`Bearer` scheme, or a wrong token is answered `401` with
+`WWW-Authenticate: Bearer` — on `/mcp` and on both halves of the deprecated SSE
+surface (`/sse`, `/messages/`). The comparison is constant-time
+(`hmac.compare_digest`), and auth is the outermost layer, so an unauthenticated
+caller learns nothing about the transport's DNS-rebinding allow-list.
+
+Non-loopback binds (e.g. `--host 0.0.0.0`) **require** the token — `gflow serve`
+refuses to start without one (exit 11). A loopback bind with no token stays
+unauthenticated, which is the local single-user default.
+
+> **Note:** the background `FlowWorker` queue manager and the REST `/api/v1`
+> surface are built as internal foundation but are **not yet wired into**
+> `gflow serve` — it currently runs the MCP/SSE server only. See the
+> [CHANGELOG](../CHANGELOG.md) for the roadmap.
+
+> **However you register it, that server then gates your upgrades.** Every client
+> above starts a long-lived `gflow mcp run` — one per session — and on Windows it
+> holds the install open, so a package manager can abort part-way through
+> `gflow update` and leave the environment broken. Stop the servers first:
+> [USAGE § `gflow update`](USAGE.md#gflow-update).
+
+---
+
+## 5. Security & Anti-Bot Mitigations
+
+Because the MCP server runs locally, inheriting the host user's permissions and access to their authenticated browser cookies, the following security constraints are enforced:
+
+1. **Profile Pre-flight:** Before enqueuing work, each tool resolves and validates the target profile directory (`_resolve_and_validate_profile` — existence and home-boundary checks). There is **no session-validity probe before launching Chromium**: expired cookies surface as a typed `AuthExpiredError` from the generation run itself, with the remediation `Run 'gflow auth login' in your local terminal.`
+2. **Channel Isolation:** All internal `structlog` configurations are forced to write to `sys.stderr`. The standard output stream (`sys.stdout`) is globally captured and redirected to `sys.stderr` for any unexpected prints, preserving the integrity of the stdio JSON-RPC pipe.
+3. **Windows Stdio Encoding:** During startup, stdio streams are explicitly reconfigured:
+   ```python
+   sys.stdout.reconfigure(encoding='utf-8')
+   sys.stdin.reconfigure(encoding='utf-8')
+   ```
+   This prevents crashes caused by non-ASCII prompt strings on Windows.
+4. **Local Rate-Limiting:** Enforces a token-bucket rate limiter with a capacity of 8 tokens and a refill rate of 1 token every 20 seconds (allowing burst filmmaking tasks without timeouts). This is the **only** spend brake — there is no credit-budget accounting or per-session/daily cap (#495; a registration-time `--no-spend` gate is tracked in #496).
+5. **CLI-MCP Parameter Symmetry:** Two CI layers guard the surfaces against drift: `tests/mcp/test_cli_parity.py` forces an explicit MCP decision (mapped tool or stated exemption) for every CLI leaf command, and `tests/mcp/test_server.py::TestCliMcpParameterSymmetry` compares CLI Click parameters against registered tool signatures for the two generate tools. Parameter-level comparison does not yet cover the other tools.
+6. **No-Spend Mode (#496):** `gflow mcp run --no-spend` (or `GFLOW_MCP_NO_SPEND=1`, which also covers `gflow serve`) never registers the credit-spending generate tools — `gflow_generate_image` and `gflow_generate_video` are absent from `tools/list` entirely, rather than present-but-refusing. Both are gated because image generation is only empirically free and no-spend is a hard guarantee. Listing, instructions, and other read-only tools remain available.
+
+---
+
+## 6. Troubleshooting a failed tool call
+
+A failing MCP tool call gives an agent much less to go on than a CLI run gives a human:
+there is no `--help` to re-read, no stderr to scroll, and the envelope is deliberately
+narrow (no local paths, no raw exception text — see [§ Error envelope](#error-envelope)).
+This section is the decoder.
+
+**Read the envelope in this order:** `retryable` → `status` → `title` → `detail`. Never
+re-derive `retryable` from the class name; a raise site can override its class, and one
+does today.
+
+### 6.1 First question: what state is this account's Flow in?
+
+Google has moved Flow from `labs.google/fx/tools/flow` onto `flow.google.com`, and **the
+move is not one step**. Measured 2026-09-14 (3 accounts x 2 entry points x 2 runs): the old
+labs URL answers **HTTP 308 Permanent Redirect** on every account tested, yet those same
+accounts differ in which capabilities work. So the host you are served does **not** tell
+you what works — several capability states coexist behind one frontend, they change without
+notice, and most confusing failures here are really "this account is in a different state
+than the one the message assumes". Establish the state before diagnosing anything else — it
+is a $0, read-only check:
+
+```bash
+gflow auth status          # which host minted the session, and for whom
+gflow credits user         # does the Bearer path still work for this account?
+```
+
+| `auth status` | `credits user` | What you are on | Consequence |
+|---|---|---|---|
+| verified | a balance | labs session alive | Everything documented works |
+| verified | fails, `"the labs.google session returned no access token"` | migrated; labs authenticates but never mints the `ya29` Bearer | `credits` cannot work. Since v0.73.2 the remediation says so ([#795](https://github.com/ffroliva/gflow-cli/issues/795)) |
+| verified | fails, `"credits endpoint returned 401"` | migrated; a token exists but aisandbox-pa rejects it | Same outcome, different raise site. Since v0.74.0 this one names the cause too ([#795](https://github.com/ffroliva/gflow-cli/issues/795)); through v0.73.2 it read `"aisandbox-pa returned 401 after token refresh"`. Measured on a migrated account, 2026-09-13 |
+| "Signed in to Google, but not to the Flow app" **forever** | — | migrated; labs no longer mints a Flow session at all | Login cannot complete on the released build. Tracked in [#791](https://github.com/ffroliva/gflow-cli/issues/791) |
+| "Signed in to Google, but not to the Flow app" | — | **or** the account has no Flow access at all | Same sentence, second cause. The session endpoint answers 200 with an empty `user` for an abandoned sign-in *and* for an account with no Google AI Plus/Pro/Ultra (or qualifying Workspace) plan, so `auth status` cannot tell them apart. Open `https://flow.google.com` in a browser on that account: a landing on `/unavailable` means this row. A generation command says so directly — **exit 39**, `FlowAccessUnavailableError` |
+
+In every migrated row above, **generation over the migrated composer still works** — only
+the aisandbox REST reads fail. The one exception is the agent-only composer described
+below, where there is no composer for gflow to drive at all.
+
+> **A `credits` failure does not mean your cookies are stale.** Two raise sites produce it
+> — labs answering with no token, and aisandbox-pa rejecting the token labs did issue —
+> and since v0.74.0 **both name the real cause**. On a migrated account SAPISID is
+> typically present and fine, and **re-running `gflow auth login` will not help**. If the
+> profile has no browser-strategy marker yet, it can make things worse: a failed *first*
+> login rolls that marker back. **If `auth status` says verified and only `credits` fails,
+> believe `auth status`.** Through v0.73.2 the second site carried the class-default
+> SAPISID advice instead — see the CHANGELOG for why.
+
+The migrated composer itself also comes in more than one shape. Since v0.74.0 an account
+whose composer is **agent-only** — no classic composer at all — is named as such before
+submit: `FlowAgentUiError`, **exit-25-equivalent**, `retryable: false`, saying the settings trigger is
+present but hidden and that no `agent-mode-chip` exists to turn off. Through v0.73.2 that
+same account got a generic selector-drift envelope (exit 23), which reads as *our* bug and
+invites a retry that cannot work ([#799](https://github.com/ffroliva/gflow-cli/issues/799)).
+
+The distinction that matters, because the DOM is identical either way: a **pressed chip**
+means the classic arm exists and gflow turns it back on itself
+([#749](https://github.com/ffroliva/gflow-cli/issues/749)); **no chip at all** means there
+is no classic arm to return to, aspect / model / count are Agent-settings defaults rather
+than per-request controls, and no flag or profile change helps. Generating from the Flow
+web UI still works.
+
+### 6.2 Envelope → cause → what to do
+
+| What you see | Almost always | Do this |
+|---|---|---|
+| `retryable: true`, WAF / rate-limit / timeout | Transient | Re-run once. If it repeats immediately, stop — it is not transient |
+| selector drift, *"the frame picker stayed open … and stayed open after its confirm was clicked"* | Flow changed the Frames picker again | File it with the verbatim `detail`; the raise sites are textually distinct and the string identifies which one |
+| selector drift, *"… and carries no confirm"* | A cohort whose picker neither commits nor offers a confirm | As above — this is a new shape, not [#792](https://github.com/ffroliva/gflow-cli/issues/792) |
+| *"the Start chip did not bind"* | The search and the click both landed; the chip still did not take the thumbnail | **Not retryable** (`retryable: false`) — gflow refuses to submit rather than let it go out as text-to-video. File it with the verbatim detail. (Late server-side indexing is a *different* failure — "lists no asset named …" — and that path already retries internally) |
+| exit-27-equivalent, upload rejected, a dialog opened and no request left the page | Flow's **one-time** "rights to use this image" confirmation | Open the project on flow.google.com, upload any image **by hand**, accept it. gflow will not click it for you: it affirms that *you* hold the rights. Once per account, then uploads run unattended |
+| exit-39-equivalent, *"This Google account cannot reach Flow"* | The account has no Flow access — it needs a Google AI Plus/Pro/Ultra or qualifying Workspace plan, an age-verified account and a supported region | **Stop. Do not retry, and do not call `gflow_auth_status` or suggest a re-login** — this is the one envelope where a retry is guaranteed futile, because the editor does not exist for this account. Relay the `remediation_hint` and its link verbatim; only the human can fix it. Note `auth status` will separately claim the Flow sign-in was not completed, which is [the same sentence with a second cause](#61-first-question-what-state-is-this-accounts-flow-in) |
+| exit-36-equivalent | The capability is not ported to the migrated host | See [CONFIGURATION § GFLOW_CLI_FLOW_HOST](CONFIGURATION.md#gflow_cli_flow_host) for exactly what is served there |
+| *"Profile is missing its browser-strategy marker"* (409, `retryable: false`, from `gflow_auth_status`) | The profile's browser-strategy marker is gone — typically after a failed first login | `gflow auth login --browser chrome`. It is **not** a network problem, whatever an older build told you |
+| `"Unexpected <Class>; details were logged server-side."` (500) | A non-gflow exception; the text is masked on purpose | Read the server's structured log for `mcp.tool.unexpected_error` — the traceback is there, not in the envelope |
+
+### 6.3 Getting evidence an agent can actually send
+
+The envelope carries an `incident` object (`{id, capture_status}` only — never a path).
+Resolve it on the machine running the server:
+
+```
+<GFLOW_CLI_HOME>/incidents/<YYYY-MM-DD>/<stamp>-<incident-id>-<rand>/
+```
+
+Layout and what triggers a capture are in
+[DEBUGGING § Automatic incident bundles](DEBUGGING.md#automatic-incident-bundles).
+
+**Judge the bundle before you trust it.** A bundle whose `ui.json` has all tag counts at
+`0` and a blank white screenshot photographed an `about:blank` page, not your failure —
+that was a real defect in gflow (fixed in v0.73.2), so a bundle with that signature from an
+older build carries **no** information about what went wrong. It is not evidence that the
+page was blank.
+
+For a run you can reproduce, raise the log level on the server process
+(`GFLOW_CLI_LOG_LEVEL=DEBUG`) and capture stderr — MCP writes every structured log line
+there, never to the stdio pipe.
+
+### 6.4 Before filing
+
+Include the verbatim `detail` string, the `retryable`/`status` pair, the two cohort
+commands from §6.1, and `gflow --version`. **Redact** account identifiers, cookie and token
+values, and signed media URLs before pasting anything into an issue. If you have an
+incident bundle, say so — but do not paste it: it contains prompts and can contain
+identity-bearing attributes.
