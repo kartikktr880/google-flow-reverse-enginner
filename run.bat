@@ -1,10 +1,25 @@
 @echo off
-echo [1/3] Installing Dependencies...
-pip install -r requirements.txt
-pip install -e ./gflow-cli
-echo [2/3] Starting Local Studio Engine Bridge...
-start /b python server.py
-timeout /t 3 /nobreak >nul
-echo [3/3] Launching Dynamic Rhyme Pipeline...
+setlocal enabledelayedexpansion
+
+:: Add user script directories to PATH dynamically
+set "PATH=%APPDATA%\Python\Python314\Scripts;%LOCALAPPDATA%\Programs\Python\Python314\Scripts;%PATH%"
+
+echo [1/4] Ensuring Directories...
+if not exist "output\scenes" mkdir "output\scenes"
+if not exist "output\manifests" mkdir "output\manifests"
+
+echo [2/4] Installing Required Dependencies...
+python -m pip install -r requirements.txt --quiet
+python -m pip install -e ./gflow-cli --quiet
+python -m playwright install chromium
+
+echo [3/4] Starting Engine Daemon on Port 8080...
+start "Studio-Bridge-Server" /b python server.py
+
+echo Waiting for Daemon startup...
+timeout /t 4 /nobreak >nul
+
+echo [4/4] Triggering Dynamic Rhyme Pipeline...
 python dynamic_rhyme_pipeline.py --preset hindi
+
 pause

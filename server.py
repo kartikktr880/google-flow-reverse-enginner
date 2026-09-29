@@ -10,7 +10,9 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import uvicorn
 
-OUTPUT_DIR = Path(r"C:\Users\Administrator\google-flow\output\scenes")
+# Zero hardcoding: Always resolves relative to current repository directory
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "output" / "scenes"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 TASKS: Dict[str, dict] = {}
@@ -60,7 +62,6 @@ async def gflow_worker():
         ref_image = task.get("reference_image_path")
         chosen_model = "veo-fast"
         
-        # Dropped --duration so Flow uses native default duration cleanly
         if ref_image and os.path.exists(ref_image):
             cmd = [
                 "gflow", "video", "r2v",
