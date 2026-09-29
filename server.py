@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 import uuid
 import subprocess
 from pathlib import Path
@@ -10,7 +11,6 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import uvicorn
 
-# Zero hardcoding: Always resolves relative to current repository directory
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output" / "scenes"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -62,17 +62,20 @@ async def gflow_worker():
         ref_image = task.get("reference_image_path")
         chosen_model = "veo-fast"
         
+        # Use sys.executable -m gflow_cli to bypass any PATH configuration issues
+        base_cmd = [sys.executable, "-m", "gflow_cli", "video"]
+        
         if ref_image and os.path.exists(ref_image):
-            cmd = [
-                "gflow", "video", "r2v",
+            cmd = base_cmd + [
+                "r2v",
                 final_prompt,
                 "--ref", str(ref_image),
                 "--model", chosen_model,
                 "--out-dir", str(OUTPUT_DIR)
             ]
         else:
-            cmd = [
-                "gflow", "video", "t2v",
+            cmd = base_cmd + [
+                "t2v",
                 final_prompt,
                 "--model", chosen_model,
                 "--out-dir", str(OUTPUT_DIR)
@@ -85,6 +88,8 @@ async def gflow_worker():
                 stderr=asyncio.subprocess.PIPE
             )
             stdout, stderr = await proc.communicate()
+            out_str = stdout.decode(errors="replace").strip()
+            err_str = stderr.decode(errors="replace").strip()
             
             if proc.returncode == 0:
                 task["status"] = "COMPLETED"
@@ -98,7 +103,7 @@ async def gflow_worker():
                     task["last_frame_path"] = extract_last_frame(str(latest_mp4), frame_dest)
             else:
                 task["status"] = "FAILED"
-                task["error"] = stderr.decode(errors="replace").strip()
+                task["error"] = f"{out_str} | {err_str}".strip(" |")
         except Exception as e:
             task["status"] = "FAILED"
             task["error"] = str(e)
