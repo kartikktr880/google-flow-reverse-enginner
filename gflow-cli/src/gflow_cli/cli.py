@@ -16,7 +16,8 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
-from gflow_cli import __version__, profile_store
+from gflow_cli import __version__
+from gflow_cli import profile_store
 from gflow_cli import auth as auth_mod
 from gflow_cli.cli_character import character as _character_group
 from gflow_cli.cli_credits import credits as _credits_group
