@@ -3,6 +3,7 @@ import os
 import sys
 import uuid
 import subprocess
+import re
 from pathlib import Path
 from typing import Optional, Dict
 from contextlib import asynccontextmanager
@@ -18,6 +19,11 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 TASKS: Dict[str, dict] = {}
 CHARACTERS: Dict[str, dict] = {}
 job_queue = asyncio.Queue()
+
+# Global Project Memory: Reuse flow project to bypass cold-start latency
+SESSION_STATE = {
+    "active_project_id": None
+}
 
 class CharacterCreateRequest(BaseModel):
     name: str
@@ -42,6 +48,26 @@ def extract_last_frame(video_path: str, output_image_path: str):
     except Exception:
         return None
 
+async def execute_gflow_command(cmd):
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+    out_str = stdout.decode(errors="replace").strip()
+    err_str = stderr.decode(errors="replace").strip()
+    combined_log = f"{out_str}\n{err_str}".strip()
+    
+    # Extract project_id if a new project was created
+    match = re.search(r'flow\.google\.com/project/([a-zA-Z0-9\-]+)', combined_log)
+    if not match:
+        match = re.search(r'"project_id":\s*"([a-zA-Z0-9\-]+)"', combined_log)
+    if match:
+        SESSION_STATE["active_project_id"] = match.group(1)
+        
+    return proc.returncode, combined_log
+
 async def gflow_worker():
     while True:
         task_id = await job_queue.get()
@@ -51,7 +77,6 @@ async def gflow_worker():
             continue
 
         task["status"] = "IN_PROGRESS"
-        
         final_prompt = task["prompt"]
         char_id = task.get("character_id")
         if char_id and char_id in CHARACTERS:
@@ -61,52 +86,46 @@ async def gflow_worker():
 
         ref_image = task.get("reference_image_path")
         chosen_model = "veo-fast"
-        
-        # Use sys.executable -m gflow_cli to bypass any PATH configuration issues
         base_cmd = [sys.executable, "-m", "gflow_cli", "video"]
         
+        # Build command with project reuse if available
         if ref_image and os.path.exists(ref_image):
-            cmd = base_cmd + [
-                "r2v",
-                final_prompt,
-                "--ref", str(ref_image),
-                "--model", chosen_model,
-                "--out-dir", str(OUTPUT_DIR)
-            ]
+            sub_args = ["r2v", final_prompt, "--ref", str(ref_image), "--model", chosen_model, "--out-dir", str(OUTPUT_DIR)]
         else:
-            cmd = base_cmd + [
-                "t2v",
-                final_prompt,
-                "--model", chosen_model,
-                "--out-dir", str(OUTPUT_DIR)
-            ]
+            sub_args = ["t2v", final_prompt, "--model", chosen_model, "--out-dir", str(OUTPUT_DIR)]
             
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await proc.communicate()
-            out_str = stdout.decode(errors="replace").strip()
-            err_str = stderr.decode(errors="replace").strip()
+        if SESSION_STATE["active_project_id"]:
+            sub_args.extend(["--project", SESSION_STATE["active_project_id"]])
             
-            if proc.returncode == 0:
-                task["status"] = "COMPLETED"
-                mp4s = sorted(OUTPUT_DIR.glob("*.mp4"), key=os.path.getmtime, reverse=True)
-                if mp4s:
-                    latest_mp4 = mp4s[0]
-                    task["video_path"] = str(latest_mp4)
-                    task["download_url"] = f"/api/v1/assets/{latest_mp4.name}"
-                    
-                    frame_dest = str(OUTPUT_DIR / f"frame_{latest_mp4.stem}.jpg")
-                    task["last_frame_path"] = extract_last_frame(str(latest_mp4), frame_dest)
-            else:
-                task["status"] = "FAILED"
-                task["error"] = f"{out_str} | {err_str}".strip(" |")
-        except Exception as e:
+        full_cmd = base_cmd + sub_args
+        
+        # Execution with 1 automatic retry
+        returncode, log_output = await execute_gflow_command(full_cmd)
+        if returncode != 0:
+            # Fallback retry without fixed project if project handle got stale
+            sub_args_clean = [arg for arg in sub_args if arg not in ("--project", SESSION_STATE.get("active_project_id", ""))]
+            returncode, log_output = await execute_gflow_command(base_cmd + sub_args_clean)
+            
+        if returncode == 0:
+            task["status"] = "COMPLETED"
+            mp4s = sorted(OUTPUT_DIR.glob("*.mp4"), key=os.path.getmtime, reverse=True)
+            if mp4s:
+                latest_mp4 = mp4s[0]
+                frame_dest = str(OUTPUT_DIR / f"frame_{latest_mp4.stem}.jpg")
+                extracted_frame = extract_last_frame(str(latest_mp4), frame_dest)
+                
+                # Expose all aliases required by caller pipelines
+                task["video_path"] = str(latest_mp4)
+                task["output_path"] = str(latest_mp4)
+                task["saved_video"] = str(latest_mp4)
+                task["video_file"] = str(latest_mp4)
+                task["download_url"] = f"/api/v1/assets/{latest_mp4.name}"
+                task["download"] = f"/api/v1/assets/{latest_mp4.name}"
+                task["last_frame_path"] = extracted_frame
+                task["last_frame"] = extracted_frame
+        else:
             task["status"] = "FAILED"
-            task["error"] = str(e)
+            task["error"] = log_output
 
         job_queue.task_done()
 
@@ -116,7 +135,7 @@ async def lifespan(app: FastAPI):
     yield
     worker_task.cancel()
 
-app = FastAPI(title="Studio Veo Engine Bridge", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="Studio Veo Engine Bridge", version="3.1.0", lifespan=lifespan)
 
 @app.get("/health")
 @app.get("/api/v1/health")
@@ -125,8 +144,7 @@ def health():
         "status": "healthy",
         "service": "studio-engine-bridge",
         "port": 8080,
-        "gemini_api_key_configured": True,
-        "api_key_configured": True
+        "active_project": SESSION_STATE["active_project_id"]
     }
 
 @app.post("/api/v1/characters/create", status_code=status.HTTP_201_CREATED)
@@ -143,7 +161,6 @@ def create_character(req: CharacterCreateRequest):
 @app.post("/api/v1/scenes/generate", status_code=status.HTTP_202_ACCEPTED)
 async def generate_scene(req: SceneGenerateRequest):
     tid = f"task_{uuid.uuid4().hex[:10]}"
-    
     TASKS[tid] = {
         "task_id": tid,
         "prompt": req.prompt,
@@ -153,7 +170,9 @@ async def generate_scene(req: SceneGenerateRequest):
         "character_id": req.character_id,
         "status": "QUEUED",
         "video_path": None,
+        "output_path": None,
         "download_url": None,
+        "download": None,
         "last_frame_path": None
     }
     await job_queue.put(tid)

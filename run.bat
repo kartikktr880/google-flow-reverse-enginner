@@ -1,25 +1,39 @@
 @echo off
 setlocal enabledelayedexpansion
 
-:: Add user script directories to PATH dynamically
-set "PATH=%APPDATA%\Python\Python314\Scripts;%LOCALAPPDATA%\Programs\Python\Python314\Scripts;%PATH%"
+echo ==========================================================
+echo [1/4] Cleaning Stale Engine Processes on Port 8080...
+echo ==========================================================
+for /f "tokens=5" %%a in ('netstat -aon ^| findstr :8080 ^| findstr LISTENING') do (
+    taskkill /f /pid %%a >nul 2>&1
+)
 
-echo [1/4] Ensuring Directories...
 if not exist "output\scenes" mkdir "output\scenes"
 if not exist "output\manifests" mkdir "output\manifests"
 
-echo [2/4] Installing Required Dependencies...
+echo ==========================================================
+echo [2/4] Verifying Environment...
+echo ==========================================================
 python -m pip install -r requirements.txt --quiet
 python -m pip install -e ./gflow-cli --quiet
-python -m playwright install chromium
 
-echo [3/4] Starting Engine Daemon on Port 8080...
+echo ==========================================================
+echo [3/4] Launching Studio Engine Daemon...
+echo ==========================================================
 start "Studio-Bridge-Server" /b python server.py
 
-echo Waiting for Daemon startup...
-timeout /t 4 /nobreak >nul
+:WAIT_HEALTH
+timeout /t 2 /nobreak >nul
+powershell -Command "try { (Invoke-WebRequest -Uri 'http://127.0.0.1:8080/health' -UseBasicParsing).StatusCode } catch { exit 1 }" >nul 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    echo Waiting for bridge to respond...
+    goto WAIT_HEALTH
+)
+echo Engine bridge is fully online and ready!
 
-echo [4/4] Triggering Dynamic Rhyme Pipeline...
+echo ==========================================================
+echo [4/4] Starting Nursery Rhyme Dynamic Orchestrator...
+echo ==========================================================
 python dynamic_rhyme_pipeline.py --preset hindi
 
 pause
