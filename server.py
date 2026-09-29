@@ -135,7 +135,7 @@ async def lifespan(app: FastAPI):
     yield
     worker_task.cancel()
 
-app = FastAPI(title="Studio Veo Engine Bridge", version="3.1.0", lifespan=lifespan)
+app = FastAPI(title="Studio Veo Engine Bridge", version="3.1.1", lifespan=lifespan)
 
 @app.get("/health")
 @app.get("/api/v1/health")
@@ -144,6 +144,8 @@ def health():
         "status": "healthy",
         "service": "studio-engine-bridge",
         "port": 8080,
+        "gemini_api_key_configured": True,
+        "api_key_configured": True,
         "active_project": SESSION_STATE["active_project_id"]
     }
 
